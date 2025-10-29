@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import cgi
 import io
 import sys
 import time
@@ -348,17 +347,47 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
         if method == "GET":
             return respond("200 OK", render_bulk_form())
         # POST: process CSV upload
-        form = cgi.FieldStorage(fp=environ["wsgi.input"], environ=environ, keep_blank_values=True)
-        file_item = form.getfirst("file") or None
-        # cgi.FieldStorage returns FieldStorage for file; use form["file"]
-        fs = form["file"] if "file" in form else None
-        if fs is None or not getattr(fs, "file", None):
-            return respond("400 Bad Request", render_bulk_form(message="No file uploaded."))
+        # Minimal multipart/form-data parser (no cgi)
+        content_type = environ.get("CONTENT_TYPE", "")
+        if "multipart/form-data" not in content_type:
+            return respond("400 Bad Request", render_bulk_form(message="Invalid content type."))
+        boundary_key = "boundary="
+        boundary_index = content_type.find(boundary_key)
+        if boundary_index == -1:
+            return respond("400 Bad Request", render_bulk_form(message="Missing multipart boundary."))
+        boundary = content_type[boundary_index + len(boundary_key) :].strip()
+        if boundary.startswith('"') and boundary.endswith('"'):
+            boundary = boundary[1:-1]
         try:
-            raw = fs.file.read()
-            text = raw.decode("utf-8-sig", errors="replace")
+            size = int(environ.get("CONTENT_LENGTH") or 0)
+        except ValueError:
+            size = 0
+        raw_body = environ["wsgi.input"].read(size)
+        delim = ("--" + boundary).encode()
+        parts = raw_body.split(delim)
+        file_bytes: bytes | None = None
+        for part in parts:
+            part = part.lstrip(b"\r\n")
+            if not part or part.startswith(b"--"):
+                continue
+            header_end = part.find(b"\r\n\r\n")
+            if header_end == -1:
+                continue
+            headers_blob = part[:header_end].decode("utf-8", errors="ignore")
+            content = part[header_end + 4 :]
+            # trim trailing CRLF if present
+            if content.endswith(b"\r\n"):
+                content = content[:-2]
+            dispo_line = next((h for h in headers_blob.split("\r\n") if h.lower().startswith("content-disposition:")), "")
+            if "name=\"file\"" in dispo_line:
+                file_bytes = content
+                break
+        if file_bytes is None:
+            return respond("400 Bad Request", render_bulk_form(message="No file part named 'file'."))
+        try:
+            text = file_bytes.decode("utf-8-sig", errors="replace")
         except Exception as exc:
-            return respond("400 Bad Request", render_bulk_form(message=f"Failed to read file: {exc}"))
+            return respond("400 Bad Request", render_bulk_form(message=f"Failed to decode file: {exc}"))
 
         reader = csv.reader(io.StringIO(text))
         rows = list(reader)
