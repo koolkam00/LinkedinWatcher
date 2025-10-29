@@ -192,9 +192,16 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
     path = environ.get("PATH_INFO", "/") or "/"
     method = environ.get("REQUEST_METHOD", "GET").upper()
 
-    def respond(status: str, body: str, content_type: str = "text/html; charset=utf-8"):
+    def respond(
+        status: str,
+        body: str,
+        content_type: str = "text/html; charset=utf-8",
+        extra_headers: list[tuple[str, str]] | None = None,
+    ):
         data = body.encode("utf-8")
         headers = [("Content-Type", content_type), ("Content-Length", str(len(data)))]
+        if extra_headers:
+            headers.extend(extra_headers)
         start_response(status, headers)
         return [data]
 
@@ -218,7 +225,12 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
         if not name or not url.lower().startswith("http"):
             return respond("400 Bad Request", render_people(state, "Invalid name or URL."))
         add_person(name=name, firm=firm, profile_url=url)
-        return respond("303 See Other", "", content_type="text/plain; charset=utf-8")
+        return respond(
+            "303 See Other",
+            "",
+            content_type="text/plain; charset=utf-8",
+            extra_headers=[("Location", "/")],
+        )
 
     if method == "POST" and path == "/set_firm":
         try:
@@ -231,7 +243,12 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
         clear = (form.get("clear", [""])[0] or "").strip() == "1"
         firm = None if clear else ((form.get("firm", [""])[0] or "").strip() or None)
         update_person_firm_by_id(pid, firm)
-        return respond("303 See Other", "", content_type="text/plain; charset=utf-8")
+        return respond(
+            "303 See Other",
+            "",
+            content_type="text/plain; charset=utf-8",
+            extra_headers=[("Location", "/people")],
+        )
 
     if path == "/run":
         if method == "GET":
