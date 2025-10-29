@@ -18,6 +18,7 @@ import csv
 import io
 import sys
 import time
+import threading
 from typing import Callable, Iterable, Optional
 
 from wsgiref.simple_server import make_server
@@ -200,7 +201,7 @@ def render_bulk_form(message: Optional[str] = None, output: Optional[str] = None
         + f"""
         <section>
           <h2>Bulk Upload (CSV)</h2>
-          <p>Upload a CSV exported from Excel. Columns supported (header optional): <strong>url</strong>, <em>name</em>, <em>firm</em>. Only <strong>url</strong> is required. If name/firm are missing, the app will try to auto-detect from the public profile.</p>
+          <p>Upload a CSV exported from Excel. Columns supported (header optional): <strong>url</strong>, <em>name</em>, <em>firm</em>. Only <strong>url</strong> is required. Large uploads are processed in the background to avoid timeouts.</p>
           <form method="post" action="/bulk" enctype="multipart/form-data">
             <input type="file" name="file" accept=".csv" required />
             <button class="btn" type="submit">Upload & Add</button>
@@ -389,68 +390,65 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
         except Exception as exc:
             return respond("400 Bad Request", render_bulk_form(message=f"Failed to decode file: {exc}"))
 
-        reader = csv.reader(io.StringIO(text))
-        rows = list(reader)
-        if not rows:
-            return respond("200 OK", render_bulk_form(message="CSV is empty."))
+        # Count rows quickly for user feedback
+        try:
+            total_rows = sum(1 for _ in csv.reader(io.StringIO(text)))
+        except Exception:
+            total_rows = 0
 
-        # Detect header
-        header = [h.strip().lower() for h in rows[0]]
-        has_header = "url" in header or "name" in header or "firm" in header
-        start_idx = 1 if has_header else 0
+        def _background_process(csv_text: str) -> None:
+            reader_local = csv.reader(io.StringIO(csv_text))
+            rows_local = list(reader_local)
+            if not rows_local:
+                return
+            header_local = [h.strip().lower() for h in rows_local[0]]
+            has_header_local = (
+                "url" in header_local or "name" in header_local or "firm" in header_local
+            )
+            start_idx_local = 1 if has_header_local else 0
 
-        def get_cols(row):
-            if has_header:
-                mapping = {header[i]: (row[i].strip() if i < len(row) else "") for i in range(len(header))}
-                return mapping.get("url", ""), mapping.get("name", ""), mapping.get("firm", "")
-            # fallback positional: url[, name][, firm]
-            url = row[0].strip() if len(row) > 0 else ""
-            name = row[1].strip() if len(row) > 1 else ""
-            firm = row[2].strip() if len(row) > 2 else ""
-            return url, name, firm
+            def get_cols_local(row):
+                if has_header_local:
+                    mapping = {
+                        header_local[i]: (row[i].strip() if i < len(row) else "")
+                        for i in range(len(header_local))
+                    }
+                    return mapping.get("url", ""), mapping.get("name", ""), mapping.get("firm", "")
+                url = row[0].strip() if len(row) > 0 else ""
+                name = row[1].strip() if len(row) > 1 else ""
+                firm = row[2].strip() if len(row) > 2 else ""
+                return url, name, firm
 
-        added = 0
-        skipped = 0
-        msgs: list[str] = []
-        for row in rows[start_idx:]:
-            if not row or all((cell or "").strip() == "" for cell in row):
-                continue
-            url, name, firm = get_cols(row)
-            if not url.lower().startswith("http"):
-                skipped += 1
-                msgs.append(f"[SKIP] invalid_url: {url}")
-                continue
-            # Auto-detect if name missing
-            if not name:
+            for row in rows_local[start_idx_local:]:
+                if not row or all((cell or "").strip() == "" for cell in row):
+                    continue
+                url, name, firm = get_cols_local(row)
+                if not url.lower().startswith("http"):
+                    continue
+                # Avoid long request time: do not auto-detect here; rely on tracker run
+                # If name missing, try a lightweight detect but without sleep
+                if not name:
+                    try:
+                        res = fetch_public_headline(url)
+                        if not res.get("error"):
+                            name = (res.get("name_from_page") or "").strip() or name
+                            if not firm:
+                                firm = (res.get("company") or "").strip() or firm
+                    except Exception:
+                        pass
+                if not name:
+                    name = url  # fallback so record is created; user can edit later
                 try:
-                    res = fetch_public_headline(url)
-                    if not res.get("error"):
-                        name = (res.get("name_from_page") or "").strip() or name
-                        if not firm:
-                            firm = (res.get("company") or "").strip() or firm
-                    else:
-                        msgs.append(f"[INFO] could not auto-detect name for {url}: {res.get('error')}")
-                except Exception as exc:
-                    msgs.append(f"[INFO] auto-detect error for {url}: {exc}")
-                # be gentle
-                time.sleep(1.0)
+                    add_person(name=name, firm=(firm or None), profile_url=url)
+                except Exception:
+                    continue
 
-            if not name:
-                skipped += 1
-                msgs.append(f"[SKIP] missing name and auto-detect failed: {url}")
-                continue
-
-            try:
-                add_person(name=name, firm=(firm or None), profile_url=url)
-            except Exception as exc:
-                skipped += 1
-                msgs.append(f"[SKIP] db_error for {url}: {exc}")
-                continue
-            added += 1
-            msgs.append(f"[ADDED] {name} ({firm or '-'})")
-
-        summary = f"Added {added}, skipped {skipped}.\n" + "\n".join(msgs[:200])  # truncate long output
-        return respond("200 OK", render_bulk_form(output=summary))
+        threading.Thread(target=_background_process, args=(text,), daemon=True).start()
+        queued_msg = (
+            f"Upload received. Queued processing for approximately {max(0, total_rows - 1)} rows. "
+            "You can navigate away; entries will appear on the People page as they are added."
+        )
+        return respond("200 OK", render_bulk_form(message=queued_msg))
 
     if method == "GET" and path == "/history.csv":
         # Stream CSV in-memory for simplicity
