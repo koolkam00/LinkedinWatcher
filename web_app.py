@@ -21,6 +21,7 @@ import time
 from typing import Callable, Iterable, Optional
 
 from wsgiref.simple_server import make_server
+import os
 from urllib.parse import parse_qs
 
 from db import init_db
@@ -354,8 +355,9 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LinkedIn Watcher Web UI")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind host")
-    parser.add_argument("--port", type=int, default=8000, help="Bind port")
+    default_port = int(os.environ.get("PORT", "8000"))
+    parser.add_argument("--host", default="0.0.0.0", help="Bind host")
+    parser.add_argument("--port", type=int, default=default_port, help="Bind port")
     parser.add_argument("--delay-seconds", type=float, default=5.0, help="Default delay between requests")
     return parser.parse_args(argv)
 
