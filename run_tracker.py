@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import random
 from typing import Any
 
 from db import init_db
@@ -89,7 +90,8 @@ def main(argv: list[str] | None = None) -> int:
                 unchanged_count += 1
 
         if index < total - 1 and delay:
-            time.sleep(delay)
+            # Add small jitter to reduce likelihood of rate limiting
+            time.sleep(delay + random.uniform(0.0, 0.6))
 
     print(
         f"Checked {total} people. {changed_count} changed. "

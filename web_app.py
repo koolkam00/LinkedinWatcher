@@ -18,6 +18,7 @@ import csv
 import io
 import sys
 import time
+import random
 import threading
 from typing import Callable, Iterable, Optional
 
@@ -370,7 +371,7 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
                         else:
                             state.run_unchanged += 1
                 if idx < state.run_total - 1 and state.delay_seconds:
-                    time.sleep(state.delay_seconds)
+                    time.sleep(state.delay_seconds + random.uniform(0.0, 0.6))
             with state.run_lock:
                 state.run_output.append(
                     f"Checked {state.run_total} people. {state.run_changed} changed. "

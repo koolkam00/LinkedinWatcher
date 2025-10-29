@@ -99,7 +99,10 @@ def fetch_public_headline(profile_url: str) -> Dict[str, Optional[str]]:
             if attempt == 0 and resp_try.status_code in {500, 502, 503, 504}:
                 time.sleep(1.0)
                 continue
-            last_error = f"bad_status:{resp_try.status_code}"
+            if resp_try.status_code == 999:
+                last_error = "blocked_999"
+            else:
+                last_error = f"bad_status:{resp_try.status_code}"
             resp_try = None
             break
         if response is not None:
