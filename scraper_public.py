@@ -42,11 +42,17 @@ def fetch_public_headline(profile_url: str) -> Dict[str, Optional[str]]:
         A dictionary containing parsed headline components or error details.
     """
 
-    headers = {"User-Agent": USER_AGENT}
+    headers = {
+        "User-Agent": USER_AGENT,
+        # Be explicit to receive the standard public HTML rendition
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close",
+    }
     # Gentle retry once for transient 5xx errors; no evasion
     for attempt in range(2):
         try:
-            response = requests.get(profile_url, headers=headers, timeout=10)
+            response = requests.get(profile_url, headers=headers, timeout=15)
         except requests.RequestException as exc:  # pragma: no cover - network failure path
             return {
                 "name_from_page": None,
@@ -67,18 +73,31 @@ def fetch_public_headline(profile_url: str) -> Dict[str, Optional[str]]:
         }
 
     soup = BeautifulSoup(response.text, "html.parser")
+
     def split_headline_text(text: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
         t = text.strip()
-        if t.endswith("| LinkedIn"):
-            t = t[: -len("| LinkedIn")].strip()
+        # Trim common suffixes
+        for suffix in ("| LinkedIn", "| LinkedIn Profile", "| Professional Profile | LinkedIn"):
+            if t.endswith(suffix):
+                t = t[: -len(suffix)].strip()
+        # Prefer hyphen delimiter, then fall back to pipe
         parts = [p.strip() for p in t.split(" - ") if p.strip()]
+        if len(parts) <= 1 and "|" in t:
+            parts = [p.strip() for p in t.split("|") if p.strip()]
         name: Optional[str] = None
         title: Optional[str] = None
         company: Optional[str] = None
         if parts:
             name = parts[0]
         if len(parts) == 2:
-            title = parts[1]
+            # Sometimes the second part contains "Title at Company"
+            p = parts[1]
+            if " at " in p:
+                before, after = p.split(" at ", 1)
+                title = before.strip() or None
+                company = after.strip() or None
+            else:
+                title = p
         elif len(parts) >= 3:
             title = " - ".join(parts[1:-1]) or None
             company = parts[-1]
@@ -93,6 +112,17 @@ def fetch_public_headline(profile_url: str) -> Dict[str, Optional[str]]:
     if meta_tag and meta_tag.get("content"):
         name_from_page, title, company = split_headline_text(meta_tag["content"]) 
 
+    # Fallback: twitter:title (often mirrors page title)
+    if not title:
+        tw_title = soup.find("meta", attrs={"name": "twitter:title"}) or soup.find(
+            "meta", attrs={"property": "twitter:title"}
+        )
+        if tw_title and tw_title.get("content"):
+            n2, t2, c2 = split_headline_text(tw_title["content"]) 
+            name_from_page = name_from_page or n2
+            title = title or t2
+            company = company or c2
+
     # Fallback: og:description / meta description (if contains expected pattern)
     if not title and not company:
         desc_tag = soup.find("meta", attrs={"property": "og:description"}) or soup.find(
@@ -100,6 +130,17 @@ def fetch_public_headline(profile_url: str) -> Dict[str, Optional[str]]:
         )
         if desc_tag and desc_tag.get("content") and " - " in desc_tag["content"]:
             n2, t2, c2 = split_headline_text(desc_tag["content"])
+            name_from_page = name_from_page or n2
+            title = title or t2
+            company = company or c2
+
+    # Fallback: twitter:description
+    if not title and not company:
+        tw_desc = soup.find("meta", attrs={"name": "twitter:description"}) or soup.find(
+            "meta", attrs={"property": "twitter:description"}
+        )
+        if tw_desc and tw_desc.get("content"):
+            n2, t2, c2 = split_headline_text(tw_desc["content"]) 
             name_from_page = name_from_page or n2
             title = title or t2
             company = company or c2
@@ -126,6 +167,14 @@ def fetch_public_headline(profile_url: str) -> Dict[str, Optional[str]]:
                         company = company or (works_for["name"].strip() or None)
             if title or company:
                 break
+
+    # Fallback: <title> element text
+    if not title and not company:
+        if soup.title and soup.title.string:
+            n2, t2, c2 = split_headline_text(soup.title.string)
+            name_from_page = name_from_page or n2
+            title = title or t2
+            company = company or c2
 
     if not any([name_from_page, title, company]):
         return {
