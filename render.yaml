@@ -8,5 +8,11 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: DATA_DIR
+        value: /var/data
+    disks:
+      - name: data
+        mountPath: /var/data
+        sizeGB: 1
     autoDeploy: true
 

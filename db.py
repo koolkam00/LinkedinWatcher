@@ -10,10 +10,17 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+import os
 
 
 DB_FILENAME = "linkedintel.db"
-DB_PATH = Path(__file__).resolve().parent / DB_FILENAME
+
+# Allow persistent storage via environment variable (e.g., Render Disk mounted path)
+_data_dir = os.environ.get("DATA_DIR")
+if _data_dir:
+    DB_PATH = Path(_data_dir).expanduser().resolve() / DB_FILENAME
+else:
+    DB_PATH = Path(__file__).resolve().parent / DB_FILENAME
 
 
 def get_conn() -> sqlite3.Connection:
