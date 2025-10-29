@@ -77,6 +77,15 @@ HTML_FOOTER = """
 class AppState:
     def __init__(self, delay_seconds: float) -> None:
         self.delay_seconds = delay_seconds
+        # Background run-tracker state
+        self.run_active: bool = False
+        self.run_lock = threading.Lock()
+        self.run_output: list[str] = []
+        self.run_changed: int = 0
+        self.run_unchanged: int = 0
+        self.run_skipped: int = 0
+        self.run_total: int = 0
+        self.run_filter: str | None = None
 
 
 def render_home(state: AppState) -> str:
@@ -165,6 +174,14 @@ def render_people(state: AppState, message: Optional[str] = None) -> str:
 
 
 def render_run_form(state: AppState, output: Optional[str] = None) -> str:
+    # Prefer live background output when available
+    if state.run_active or state.run_output:
+        bg = "\n".join(state.run_output[-400:])
+        summary = (
+            f"Checked {state.run_total} people. {state.run_changed} changed. "
+            f"{state.run_unchanged} unchanged. {state.run_skipped} skipped."
+        )
+        output = (output or "") + ("\n" if output else "") + summary + "\n" + bg
     flash_html = f"<div class=flash><div class=mono>{output}</div></div>" if output else ""
     return (
         HTML_HEADER
@@ -179,7 +196,10 @@ def render_run_form(state: AppState, output: Optional[str] = None) -> str:
               <label for=delay>Delay seconds</label>
               <input id=delay name=delay type=text value="{state.delay_seconds}" />
             </div>
-            <p style="margin-top:10px"><button class=btn type=submit>Run</button></p>
+            <p style="margin-top:10px">
+              <button class=btn type=submit {'disabled' if state.run_active else ''}>Run</button>
+              {'<span style="margin-left:8px">(in progress... refresh page to update)</span>' if state.run_active else ''}
+            </p>
           </form>
         </section>
         """
@@ -283,7 +303,7 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
     if path == "/run":
         if method == "GET":
             return respond("200 OK", render_run_form(state))
-        # POST: run
+        # POST: start background run and redirect immediately to avoid timeouts
         try:
             size = int(environ.get("CONTENT_LENGTH") or 0)
         except ValueError:
@@ -298,51 +318,75 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
         except ValueError:
             pass
 
-        # Perform run inline; for small lists this is acceptable
-        people = list_people(firm_filter)
-        if not people:
-            return respond("200 OK", render_run_form(state, output="No people found for that filter."))
-
-        msgs = []
-        changed = unchanged = skipped = 0
-        for idx, person in enumerate(people):
-            person_name = person["name"]
-            firm_label = person["firm"] or "-"
-            try:
-                result = fetch_public_headline(person["profile_url"])
-            except Exception as exc:  # defensive
-                skipped += 1
-                msgs.append(f"[SKIP] {person_name} ({firm_label}) → unexpected_error:{exc}")
-                continue
-
-            error = result.get("error")
-            observed_title = result.get("title")
-            observed_company = result.get("company")
-
-            if error or (observed_title is None and observed_company is None):
-                skipped += 1
-                reason = error or "profile not public / no headline"
-                msgs.append(f"[SKIP] {person_name} ({firm_label}) → {reason}")
-            else:
+        def _background_run() -> None:
+            with state.run_lock:
+                state.run_active = True
+                state.run_output = []
+                state.run_changed = state.run_unchanged = state.run_skipped = 0
+                state.run_filter = firm_filter
+                people_local = list_people(firm_filter)
+                state.run_total = len(people_local)
+            if state.run_total == 0:
+                with state.run_lock:
+                    state.run_output.append("No people found for that filter.")
+                    state.run_active = False
+                return
+            for idx, person in enumerate(people_local):
+                person_name = person["name"]
+                firm_label = person["firm"] or "-"
                 try:
-                    diff_result = detect_and_record_change(person, observed_title, observed_company)
-                except Exception as exc:  # defensive
-                    skipped += 1
-                    msgs.append(f"[SKIP] {person_name} ({firm_label}) → diff_error:{exc}")
+                    result = fetch_public_headline(person["profile_url"])
+                except Exception as exc:
+                    with state.run_lock:
+                        state.run_skipped += 1
+                        state.run_output.append(
+                            f"[SKIP] {person_name} ({firm_label}) → unexpected_error:{exc}"
+                        )
                     continue
-                msgs.append(diff_result["message"])
-                if diff_result["changed"]:
-                    changed += 1
+                error = result.get("error")
+                observed_title = result.get("title")
+                observed_company = result.get("company")
+                if error or (observed_title is None and observed_company is None):
+                    with state.run_lock:
+                        state.run_skipped += 1
+                        reason = error or "profile not public / no headline"
+                        state.run_output.append(
+                            f"[SKIP] {person_name} ({firm_label}) → {reason}"
+                        )
                 else:
-                    unchanged += 1
+                    try:
+                        diff_result = detect_and_record_change(person, observed_title, observed_company)
+                    except Exception as exc:
+                        with state.run_lock:
+                            state.run_skipped += 1
+                            state.run_output.append(
+                                f"[SKIP] {person_name} ({firm_label}) → diff_error:{exc}"
+                            )
+                        continue
+                    with state.run_lock:
+                        state.run_output.append(diff_result["message"])
+                        if diff_result["changed"]:
+                            state.run_changed += 1
+                        else:
+                            state.run_unchanged += 1
+                if idx < state.run_total - 1 and state.delay_seconds:
+                    time.sleep(state.delay_seconds)
+            with state.run_lock:
+                state.run_output.append(
+                    f"Checked {state.run_total} people. {state.run_changed} changed. "
+                    f"{state.run_unchanged} unchanged. {state.run_skipped} skipped."
+                )
+                state.run_active = False
 
-            if idx < len(people) - 1 and state.delay_seconds:
-                time.sleep(state.delay_seconds)
-
-        msgs.append(
-            f"Checked {len(people)} people. {changed} changed. {unchanged} unchanged. {skipped} skipped."
+        # If a run is already active, just redirect back.
+        if not state.run_active:
+            threading.Thread(target=_background_run, daemon=True).start()
+        return respond(
+            "303 See Other",
+            "",
+            content_type="text/plain; charset=utf-8",
+            extra_headers=[("Location", "/run")],
         )
-        return respond("200 OK", render_run_form(state, output="\n".join(msgs)))
 
     if path == "/bulk":
         if method == "GET":
