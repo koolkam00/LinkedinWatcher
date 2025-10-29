@@ -396,7 +396,7 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
         except Exception:
             total_rows = 0
 
-        def _background_process(csv_text: str) -> None:
+        def _background_process(csv_text: str, delay_seconds: float) -> None:
             reader_local = csv.reader(io.StringIO(csv_text))
             rows_local = list(reader_local)
             if not rows_local:
@@ -419,6 +419,7 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
                 firm = row[2].strip() if len(row) > 2 else ""
                 return url, name, firm
 
+            added_urls: set[str] = set()
             for row in rows_local[start_idx_local:]:
                 if not row or all((cell or "").strip() == "" for cell in row):
                     continue
@@ -440,10 +441,33 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
                     name = url  # fallback so record is created; user can edit later
                 try:
                     add_person(name=name, firm=(firm or None), profile_url=url)
+                    added_urls.add(url)
                 except Exception:
                     continue
 
-        threading.Thread(target=_background_process, args=(text,), daemon=True).start()
+            # Auto-run tracker for newly added profiles
+            if added_urls:
+                people_all = list_people()
+                for idx, person in enumerate(people_all):
+                    if person["profile_url"] not in added_urls:
+                        continue
+                    try:
+                        result = fetch_public_headline(person["profile_url"])
+                    except Exception:
+                        continue
+                    error = result.get("error")
+                    observed_title = result.get("title")
+                    observed_company = result.get("company")
+                    if error or (observed_title is None and observed_company is None):
+                        continue
+                    try:
+                        detect_and_record_change(person, observed_title, observed_company)
+                    except Exception:
+                        continue
+                    if idx < len(people_all) - 1 and delay_seconds:
+                        time.sleep(delay_seconds)
+
+        threading.Thread(target=_background_process, args=(text, state.delay_seconds), daemon=True).start()
         queued_msg = (
             f"Upload received. Queued processing for approximately {max(0, total_rows - 1)} rows. "
             "You can navigate away; entries will appear on the People page as they are added."
