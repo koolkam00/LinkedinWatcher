@@ -20,6 +20,7 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import json
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 
 USER_AGENT = (
@@ -48,28 +49,68 @@ def fetch_public_headline(profile_url: str) -> Dict[str, Optional[str]]:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "close",
+        # Hint that this request originates from the open web (reduces authwall)
+        "Referer": "https://www.google.com/",
     }
-    # Gentle retry once for transient 5xx errors; no evasion
-    for attempt in range(2):
+    
+    def append_query_param(url: str, key: str, value: str) -> str:
+        parsed = urlparse(url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if key not in query:
+            query[key] = value
+        new_query = urlencode(query)
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
+    def is_authwall_or_login(resp: requests.Response) -> bool:
         try:
-            response = requests.get(profile_url, headers=headers, timeout=15)
-        except requests.RequestException as exc:  # pragma: no cover - network failure path
-            return {
-                "name_from_page": None,
-                "title": None,
-                "company": None,
-                "error": f"network_error:{exc.__class__.__name__}",
-            }
-        if response.status_code == 200:
+            target_url = resp.url.lower()
+        except Exception:
+            target_url = ""
+        if "authwall" in target_url or "/login" in target_url or "/checkpoint/" in target_url:
+            return True
+        text = resp.text[:5000].lower() if isinstance(resp.text, str) else ""
+        return ("sign in" in text and "linkedin" in text and "session_key" in text)
+
+    candidate_urls = [
+        profile_url,
+        append_query_param(profile_url, "trk", "public_profile"),
+        append_query_param(profile_url, "trk", "public_profile_browsemap"),
+    ]
+
+    response: Optional[requests.Response] = None
+    last_error: Optional[str] = None
+    for candidate in candidate_urls:
+        # Gentle retry once for transient 5xx errors; no evasion
+        for attempt in range(2):
+            try:
+                resp_try = requests.get(candidate, headers=headers, timeout=15)
+            except requests.RequestException as exc:  # pragma: no cover - network failure path
+                last_error = f"network_error:{exc.__class__.__name__}"
+                resp_try = None
+                break
+            if resp_try.status_code == 200:
+                if is_authwall_or_login(resp_try):
+                    last_error = "authwall"
+                    resp_try = None
+                    break
+                response = resp_try
+                last_error = None
+                break
+            if attempt == 0 and resp_try.status_code in {500, 502, 503, 504}:
+                time.sleep(1.0)
+                continue
+            last_error = f"bad_status:{resp_try.status_code}"
+            resp_try = None
             break
-        if attempt == 0 and response.status_code in {500, 502, 503, 504}:
-            time.sleep(1.0)
-            continue
+        if response is not None:
+            break
+
+    if response is None:
         return {
             "name_from_page": None,
             "title": None,
             "company": None,
-            "error": f"bad_status:{response.status_code}",
+            "error": last_error or "request_failed",
         }
 
     soup = BeautifulSoup(response.text, "html.parser")
