@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import cgi
 import io
 import sys
 import time
@@ -62,6 +63,7 @@ HTML_HEADER = """<!doctype html><html lang="en"><head>
     <a href="/" class="btn">Home</a>
     <a href="/people" class="btn">People</a>
     <a href="/run" class="btn">Run Tracker</a>
+    <a href="/bulk" class="btn">Bulk Upload</a>
     <a href="/history.csv" class="btn">Export History CSV</a>
   </nav>
 </header>
@@ -179,6 +181,34 @@ def render_run_form(state: AppState, output: Optional[str] = None) -> str:
             </div>
             <p style="margin-top:10px"><button class=btn type=submit>Run</button></p>
           </form>
+        </section>
+        """
+        + HTML_FOOTER
+    )
+
+
+def render_bulk_form(message: Optional[str] = None, output: Optional[str] = None) -> str:
+    flash = []
+    if message:
+        flash.append(f"<div class=flash>{message}</div>")
+    if output:
+        flash.append(f"<div class=flash><div class=mono>{output}</div></div>")
+    flash_html = "".join(flash)
+    sample = "url,name,firm\nhttps://www.linkedin.com/in/username1/,Jane Smith,CenterOak Partners\nhttps://www.linkedin.com/in/username2/,,\n"
+    return (
+        HTML_HEADER
+        + flash_html
+        + f"""
+        <section>
+          <h2>Bulk Upload (CSV)</h2>
+          <p>Upload a CSV exported from Excel. Columns supported (header optional): <strong>url</strong>, <em>name</em>, <em>firm</em>. Only <strong>url</strong> is required. If name/firm are missing, the app will try to auto-detect from the public profile.</p>
+          <form method="post" action="/bulk" enctype="multipart/form-data">
+            <input type="file" name="file" accept=".csv" required />
+            <button class="btn" type="submit">Upload & Add</button>
+          </form>
+          <details style="margin-top:10px"><summary>CSV example</summary>
+            <pre class=mono>{sample}</pre>
+          </details>
         </section>
         """
         + HTML_FOOTER
@@ -313,6 +343,85 @@ def app(environ, start_response):  # type: ignore[no-untyped-def]
             f"Checked {len(people)} people. {changed} changed. {unchanged} unchanged. {skipped} skipped."
         )
         return respond("200 OK", render_run_form(state, output="\n".join(msgs)))
+
+    if path == "/bulk":
+        if method == "GET":
+            return respond("200 OK", render_bulk_form())
+        # POST: process CSV upload
+        form = cgi.FieldStorage(fp=environ["wsgi.input"], environ=environ, keep_blank_values=True)
+        file_item = form.getfirst("file") or None
+        # cgi.FieldStorage returns FieldStorage for file; use form["file"]
+        fs = form["file"] if "file" in form else None
+        if fs is None or not getattr(fs, "file", None):
+            return respond("400 Bad Request", render_bulk_form(message="No file uploaded."))
+        try:
+            raw = fs.file.read()
+            text = raw.decode("utf-8-sig", errors="replace")
+        except Exception as exc:
+            return respond("400 Bad Request", render_bulk_form(message=f"Failed to read file: {exc}"))
+
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+        if not rows:
+            return respond("200 OK", render_bulk_form(message="CSV is empty."))
+
+        # Detect header
+        header = [h.strip().lower() for h in rows[0]]
+        has_header = "url" in header or "name" in header or "firm" in header
+        start_idx = 1 if has_header else 0
+
+        def get_cols(row):
+            if has_header:
+                mapping = {header[i]: (row[i].strip() if i < len(row) else "") for i in range(len(header))}
+                return mapping.get("url", ""), mapping.get("name", ""), mapping.get("firm", "")
+            # fallback positional: url[, name][, firm]
+            url = row[0].strip() if len(row) > 0 else ""
+            name = row[1].strip() if len(row) > 1 else ""
+            firm = row[2].strip() if len(row) > 2 else ""
+            return url, name, firm
+
+        added = 0
+        skipped = 0
+        msgs: list[str] = []
+        for row in rows[start_idx:]:
+            if not row or all((cell or "").strip() == "" for cell in row):
+                continue
+            url, name, firm = get_cols(row)
+            if not url.lower().startswith("http"):
+                skipped += 1
+                msgs.append(f"[SKIP] invalid_url: {url}")
+                continue
+            # Auto-detect if name missing
+            if not name:
+                try:
+                    res = fetch_public_headline(url)
+                    if not res.get("error"):
+                        name = (res.get("name_from_page") or "").strip() or name
+                        if not firm:
+                            firm = (res.get("company") or "").strip() or firm
+                    else:
+                        msgs.append(f"[INFO] could not auto-detect name for {url}: {res.get('error')}")
+                except Exception as exc:
+                    msgs.append(f"[INFO] auto-detect error for {url}: {exc}")
+                # be gentle
+                time.sleep(1.0)
+
+            if not name:
+                skipped += 1
+                msgs.append(f"[SKIP] missing name and auto-detect failed: {url}")
+                continue
+
+            try:
+                add_person(name=name, firm=(firm or None), profile_url=url)
+            except Exception as exc:
+                skipped += 1
+                msgs.append(f"[SKIP] db_error for {url}: {exc}")
+                continue
+            added += 1
+            msgs.append(f"[ADDED] {name} ({firm or '-'})")
+
+        summary = f"Added {added}, skipped {skipped}.\n" + "\n".join(msgs[:200])  # truncate long output
+        return respond("200 OK", render_bulk_form(output=summary))
 
     if method == "GET" and path == "/history.csv":
         # Stream CSV in-memory for simplicity
